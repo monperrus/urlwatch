@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 #
 # This file is part of urlwatch (https://thp.io/2008/urlwatch/).
-# Copyright (c) 2008-2018 Thomas Perl <m@thp.io>
+# Copyright (c) 2008-2022 Thomas Perl <m@thp.io>
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -33,6 +33,9 @@ import os
 import platform
 import subprocess
 import shlex
+import importlib.machinery
+import importlib.util
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -99,3 +102,39 @@ def edit_file(filename):
         raise SystemExit('Please set $VISUAL or $EDITOR.')
 
     subprocess.check_call(shlex.split(editor) + [filename])
+
+
+def import_module_from_source(module_name, source_path):
+    loader = importlib.machinery.SourceFileLoader(module_name, source_path)
+    spec = importlib.util.spec_from_file_location(module_name, source_path, loader=loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    loader.exec_module(module)
+    return module
+
+
+def chunkstring(string, length, *, numbering=False):
+    if len(string) <= length:
+        return [string]
+
+    if numbering:
+        # Subtract to fit numbering (FIXME: this breaks for > 9 chunks)
+        length -= len(' (0/0)')
+        parts = []
+        string = string.strip()
+        while string:
+            if len(string) <= length:
+                parts.append(string)
+                string = ''
+                break
+
+            idx = string.rfind(' ', 1, length + 1)
+            if idx == -1:
+                idx = string.rfind('\n', 1, length + 1)
+            if idx == -1:
+                idx = length
+            parts.append(string[:idx])
+            string = string[idx:].strip()
+        return ('{} ({}/{})'.format(part, i + 1, len(parts)) for i, part in enumerate(parts))
+
+    return (string[i:length + i].strip() for i in range(0, len(string), length))

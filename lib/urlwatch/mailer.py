@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 #
 # This file is part of urlwatch (https://thp.io/2008/urlwatch/).
-# Copyright (c) 2008-2018 Thomas Perl <m@thp.io>
+# Copyright (c) 2008-2022 Thomas Perl <m@thp.io>
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -31,6 +31,7 @@
 import smtplib
 import getpass
 import subprocess
+import hashlib
 import logging
 
 try:
@@ -52,6 +53,7 @@ class Mailer(object):
     def msg_plain(self, from_email, to_email, subject, body):
         msg = email.mime.text.MIMEText(body, 'plain', 'utf-8')
         msg['Subject'] = subject
+        msg['References'] = hashlib.sha256(subject.encode('utf8')).hexdigest()
         msg['From'] = from_email
         msg['To'] = to_email
         msg['Date'] = email.utils.formatdate()
@@ -61,6 +63,7 @@ class Mailer(object):
     def msg_html(self, from_email, to_email, subject, body_text, body_html):
         msg = email.mime.multipart.MIMEMultipart('alternative')
         msg['Subject'] = subject
+        msg['References'] = hashlib.sha256(subject.encode('utf8')).hexdigest()
         msg['From'] = from_email
         msg['To'] = to_email
         msg['Date'] = email.utils.formatdate()
@@ -72,12 +75,13 @@ class Mailer(object):
 
 
 class SMTPMailer(Mailer):
-    def __init__(self, smtp_user, smtp_server, smtp_port, tls, auth):
+    def __init__(self, smtp_user, smtp_server, smtp_port, tls, auth, insecure_password=None):
         self.smtp_server = smtp_server
         self.smtp_user = smtp_user
         self.smtp_port = smtp_port
         self.tls = tls
         self.auth = auth
+        self.insecure_password = insecure_password
 
     def send(self, msg):
         s = smtplib.SMTP(self.smtp_server, self.smtp_port)
@@ -86,13 +90,19 @@ class SMTPMailer(Mailer):
         if self.tls:
             s.starttls()
 
-        if self.auth and keyring is not None:
-            passwd = keyring.get_password(self.smtp_server, self.smtp_user)
-            if passwd is None:
-                raise ValueError('No password available in keyring for {}, {}'.format(self.smtp_server, self.smtp_user))
+        if self.auth:
+            if self.insecure_password:
+                passwd = self.insecure_password
+            elif keyring is not None:
+                passwd = keyring.get_password(self.smtp_server, self.smtp_user)
+                if passwd is None:
+                    raise ValueError('No password available in keyring for {}, {}'
+                                     .format(self.smtp_server, self.smtp_user))
+            else:
+                raise ValueError('SMTP auth is enabled, but insecure_password is not set and keyring is not available')
             s.login(self.smtp_user, passwd)
 
-        s.sendmail(msg['From'], [msg['To']], msg.as_string())
+        s.sendmail(msg['From'], msg['To'].split(','), msg.as_string())
         s.quit()
 
 
@@ -101,7 +111,7 @@ class SendmailMailer(Mailer):
         self.sendmail_path = sendmail_path
 
     def send(self, msg):
-        p = subprocess.Popen([self.sendmail_path, '-t', '-oi'],
+        p = subprocess.Popen([self.sendmail_path, '-oi', '-f', msg['From'], msg['To']],
                              stdin=subprocess.PIPE,
                              stderr=subprocess.PIPE,
                              universal_newlines=True)

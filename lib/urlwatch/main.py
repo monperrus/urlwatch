@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 #
 # This file is part of urlwatch (https://thp.io/2008/urlwatch/).
-# Copyright (c) 2008-2018 Thomas Perl <m@thp.io>
+# Copyright (c) 2008-2022 Thomas Perl <m@thp.io>
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -28,12 +28,12 @@
 # THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
-import imp
 import logging
 import os
 
 from .handler import Report
 from .worker import run_jobs
+from .util import import_module_from_source
 
 logger = logging.getLogger(__name__)
 
@@ -59,15 +59,16 @@ class Urlwatch(object):
         if hasattr(self.urlwatch_config, 'migrate_urls'):
             self.urlwatch_config.migrate_urls(self)
 
-        self.load_hooks()
-        self.load_jobs()
+        if not self.urlwatch_config.edit_hooks:
+            self.load_hooks()
+
+        if not self.urlwatch_config.edit:
+            self.load_jobs()
 
         if hasattr(self.urlwatch_config, 'migrate_urls'):
             self.urlwatch_config.migrate_cache(self)
 
     def check_directories(self):
-        if not os.path.isdir(self.urlwatch_config.urlwatch_dir):
-            os.makedirs(self.urlwatch_config.urlwatch_dir)
         if not os.path.exists(self.urlwatch_config.config):
             self.config_storage.write_default_config(self.urlwatch_config.config)
             print("""
@@ -77,14 +78,14 @@ class Urlwatch(object):
 
     def load_hooks(self):
         if os.path.exists(self.urlwatch_config.hooks):
-            imp.load_source('hooks', self.urlwatch_config.hooks)
+            import_module_from_source('hooks', self.urlwatch_config.hooks)
 
     def load_jobs(self):
         if os.path.isfile(self.urlwatch_config.urls):
             jobs = self.urls_storage.load_secure()
             logger.info('Found {0} jobs'.format(len(jobs)))
         else:
-            logger.warn('No jobs file found')
+            logger.warning('No jobs file found')
             jobs = []
 
         self.jobs = jobs

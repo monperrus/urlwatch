@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 #
 # This file is part of urlwatch (https://thp.io/2008/urlwatch/).
-# Copyright (c) 2008-2018 Thomas Perl <m@thp.io>
+# Copyright (c) 2008-2022 Thomas Perl <m@thp.io>
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -30,8 +30,8 @@
 
 import concurrent.futures
 import logging
-
-import requests
+import difflib
+import contextlib
 
 from .handler import JobState
 from .jobs import NotModifiedError
@@ -51,47 +51,61 @@ def run_parallel(func, items):
 
 
 def run_jobs(urlwatcher):
+    if not all(1 <= idx <= len(urlwatcher.jobs) for idx in urlwatcher.urlwatch_config.joblist):
+        raise ValueError(f'All job indices must be between 1 and {len(urlwatcher.jobs)}: {urlwatcher.urlwatch_config.joblist}')
     cache_storage = urlwatcher.cache_storage
-    jobs = urlwatcher.jobs
+    jobs = [job.with_defaults(urlwatcher.config_storage.config)
+            for (idx, job) in enumerate(urlwatcher.jobs) if ((idx + 1) in urlwatcher.urlwatch_config.joblist or (not urlwatcher.urlwatch_config.joblist))]
     report = urlwatcher.report
 
-    logger.debug('Processing %d jobs', len(jobs))
-    for job_state in run_parallel(lambda job_state: job_state.process(),
-                                  (JobState(cache_storage, job) for job in jobs)):
-        logger.debug('Job finished: %s', job_state.job)
+    logger.debug('Processing %d jobs (out of %d)', len(jobs), len(urlwatcher.jobs))
+    with contextlib.ExitStack() as exit_stack:
+        for job_state in run_parallel(lambda job_state: job_state.process(),
+                                      (exit_stack.enter_context(JobState(cache_storage, job)) for job in jobs)):
+            logger.debug('Job finished: %s', job_state.job)
 
-        if not job_state.job.max_tries:
-            max_tries = 0
-        else:
-            max_tries = job_state.job.max_tries
-        logger.debug('Using max_tries of %i for %s', max_tries, job_state.job)
-
-        if job_state.exception is not None:
-            if isinstance(job_state.exception, NotModifiedError):
-                logger.info('Job %s has not changed (HTTP 304)', job_state.job)
-                report.unchanged(job_state)
-            elif isinstance(job_state.exception, requests.exceptions.ConnectionError) and job_state.job.ignore_network:
-                logger.info('Connection error while executing job %s', job_state.job)
-            elif job_state.tries < max_tries:
-                logger.debug('This was try %i of %i for job %s', job_state.tries,
-                             max_tries, job_state.job)
-                job_state.save()
-            elif job_state.tries >= max_tries:
-                logger.debug('We are now at %i tries ', job_state.tries)
-                job_state.save()
-                if isinstance(job_state.exception, requests.exceptions.RequestException):
-                    # Instead of a full traceback, just show the HTTP error
-                    job_state.traceback = str(job_state.exception)
-                    report.error(job_state)
-                else:
-                    report.error(job_state)
-
-        elif job_state.old_data is not None:
-            if job_state.old_data.splitlines() != job_state.new_data.splitlines():
-                report.changed(job_state)
-                job_state.save()
+            if not job_state.job.max_tries:
+                max_tries = 0
             else:
-                report.unchanged(job_state)
-        else:
-            report.new(job_state)
-            job_state.save()
+                max_tries = job_state.job.max_tries
+            logger.debug('Using max_tries of %i for %s', max_tries, job_state.job)
+
+            if job_state.exception is not None:
+                if job_state.error_ignored:
+                    logger.info('Error while executing job %s ignored due to job config', job_state.job)
+                elif isinstance(job_state.exception, NotModifiedError):
+                    logger.info('Job %s has not changed (HTTP 304)', job_state.job)
+                    report.unchanged(job_state)
+                    if job_state.tries > 0:
+                        job_state.tries = 0
+                        job_state.save()
+                elif job_state.tries < max_tries:
+                    logger.debug('This was try %i of %i for job %s', job_state.tries,
+                                 max_tries, job_state.job)
+                    job_state.save()
+                elif job_state.tries >= max_tries:
+                    logger.debug('We are now at %i tries ', job_state.tries)
+                    job_state.save()
+                    report.error(job_state)
+
+            elif job_state.old_data is not None:
+                matched_history_time = job_state.history_data.get(job_state.new_data)
+                if matched_history_time:
+                    job_state.timestamp = matched_history_time
+                if matched_history_time or job_state.new_data == job_state.old_data:
+                    report.unchanged(job_state)
+                    if job_state.tries > 0:
+                        job_state.tries = 0
+                        job_state.save()
+                else:
+                    close_matches = difflib.get_close_matches(job_state.new_data, job_state.history_data, n=1)
+                    if close_matches:
+                        job_state.old_data = close_matches[0]
+                        job_state.timestamp = job_state.history_data[close_matches[0]]
+                    report.changed(job_state)
+                    job_state.tries = 0
+                    job_state.save()
+            else:
+                report.new(job_state)
+                job_state.tries = 0
+                job_state.save()

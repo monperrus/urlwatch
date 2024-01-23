@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 #
 # This file is part of urlwatch (https://thp.io/2008/urlwatch/).
-# Copyright (c) 2008-2018 Thomas Perl <m@thp.io>
+# Copyright (c) 2008-2022 Thomas Perl <m@thp.io>
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -35,8 +35,18 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+try:
+    import html2text as pyhtml2text
+except ImportError:
+    pyhtml2text = None
 
-def html2text(data, method, options):
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+
+
+def html2text(data, baseurl, method, options):
     """
     Convert a string consisting of HTML to plain text
     for easy difference checking.
@@ -48,27 +58,31 @@ def html2text(data, method, options):
                         options: https://linux.die.net/man/1/html2text
      'bs4'            - Use Beautiful Soup library to prettify the HTML
                         options: "parser" only, bs4 supports "lxml", "html5lib", and "html.parser"
-                        http://beautiful-soup-4.readthedocs.io/en/latest/#specifying-the-parser-to-use
+                        https://www.crummy.com/software/BeautifulSoup/bs4/doc/#specifying-the-parser-to-use
      're'             - A simple regex-based HTML tag stripper
      'pyhtml2text'    - Use Python module "html2text"
                         options: https://github.com/Alir3z4/html2text/blob/master/docs/usage.md#available-options
     """
     if method == 're':
         stripped_tags = re.sub(r'<[^>]*>', '', data)
-        d = '\n'.join((l.rstrip() for l in stripped_tags.splitlines() if l.strip() != ''))
+        d = '\n'.join((line.rstrip() for line in stripped_tags.splitlines() if line.strip() != ''))
         return d
 
     if method == 'pyhtml2text':
-        import html2text
-        parser = html2text.HTML2Text()
+        if pyhtml2text is None:
+            raise ImportError('Please install pyhtml2text')
+
+        parser = pyhtml2text.HTML2Text()
+        parser.baseurl = baseurl
         for k, v in options.items():
             setattr(parser, k.lower(), v)
         d = parser.handle(data)
         return d
 
     if method == 'bs4':
-        from bs4 import BeautifulSoup
-        parser = options.pop('parser', 'html.parser')
+        if BeautifulSoup is None:
+            raise ImportError('Please install BeautifulSoup')
+        parser = options.pop('parser', 'lxml')
         soup = BeautifulSoup(data, parser)
         d = soup.get_text(strip=True)
         return d
@@ -83,7 +97,10 @@ def html2text(data, method, options):
     stdout_encoding = 'utf-8'
 
     for k, v in options.items():
-        cmd.append('-%s %s' % (k, v) if v is True else '-%s' % k)
+        if v is not None:
+            cmd.extend(['-{}'.format(k), '{}'.format(v)])
+        else:
+            cmd.append('-{}'.format(k))
 
     logger.debug('Command: %r, stdout encoding: %s', cmd, stdout_encoding)
 

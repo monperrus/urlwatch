@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 #
 # This file is part of urlwatch (https://thp.io/2008/urlwatch/).
-# Copyright (c) 2008-2018 Thomas Perl <m@thp.io>
+# Copyright (c) 2008-2022 Thomas Perl <m@thp.io>
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -47,6 +47,10 @@ def migrate_urls(urlwatcher):
     urls_txt = os.path.join(urlwatch_config.urlwatch_dir, 'urls.txt')
     edit = urlwatch_config.edit
     add = urlwatch_config.add
+    features = urlwatch_config.features
+    edit_hooks = urlwatch_config.edit_hooks
+    edit_config = urlwatch_config.edit_config
+    gc_cache = urlwatch_config.gc_cache
 
     if os.path.isfile(urls_txt) and not os.path.isfile(urls):
         print("""
@@ -56,7 +60,7 @@ def migrate_urls(urlwatcher):
         UrlsYaml(urls).save(UrlsTxt(urls_txt).load_secure())
         atomic_rename(urls_txt, urls_txt + '.migrated')
 
-    if not os.path.isfile(urls) and not edit and not add:
+    if not any([os.path.isfile(urls), edit, add, features, edit_hooks, edit_config, gc_cache]):
         print("""
     You need to create {urls_yaml} in order to use {pkgname}.
     Use "{pkgname} --edit" to open the file with your editor.
@@ -71,7 +75,9 @@ def migrate_cache(urlwatcher):
     cache = urlwatch_config.cache
     cache_dir = os.path.join(urlwatch_config.urlwatch_dir, 'cache')
 
-    if os.path.isdir(cache_dir):
+    # On Windows and macOS with case-insensitive filesystems, we have to check if
+    # "cache.db" exists in the folder, and in this case, avoid migration (Issue #223)
+    if os.path.isdir(cache_dir) and not os.path.isfile(os.path.join(cache_dir, 'cache.db')):
         print("""
     Migrating cache: {cache_dir} -> {cache_db}
     """.format(cache_dir=cache_dir, cache_db=cache))

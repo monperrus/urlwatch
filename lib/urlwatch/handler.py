@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 #
 # This file is part of urlwatch (https://thp.io/2008/urlwatch/).
-# Copyright (c) 2008-2018 Thomas Perl <m@thp.io>
+# Copyright (c) 2008-2022 Thomas Perl <m@thp.io>
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -32,6 +32,12 @@ import datetime
 import logging
 import time
 import traceback
+import tempfile
+import difflib
+import os
+import shlex
+import subprocess
+import email.utils
 
 from .filters import FilterBase
 from .jobs import NotModifiedError
@@ -47,59 +53,126 @@ class JobState(object):
         self.verb = None
         self.old_data = None
         self.new_data = None
+        self.history_data = {}
         self.timestamp = None
+        self.current_timestamp = None
         self.exception = None
         self.traceback = None
         self.tries = 0
+        self.etag = None
+        self.error_ignored = False
+        self._generated_diff = None
+
+    def __enter__(self):
+        try:
+            self.job.main_thread_enter()
+        except Exception as ex:
+            logger.info('Exception while creating resources for job: %r', self.job, exc_info=True)
+            self.exception = ex
+            self.traceback = traceback.format_exc()
+
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            self.job.main_thread_exit()
+        except Exception as ex:
+            # We don't want exceptions from releasing resources to override job run results
+            logger.warning('Exception while releasing resources for job: %r', self.job, exc_info=True)
 
     def load(self):
-        self.old_data, self.timestamp, self.tries = self.cache_storage.load(self.job, self.job.get_guid())
+        guid = self.job.get_guid()
+        self.old_data, self.timestamp, self.tries, self.etag = self.cache_storage.load(self.job, guid)
         if self.tries is None:
             self.tries = 0
+        if self.job.compared_versions and self.job.compared_versions > 1:
+            self.history_data = self.cache_storage.get_history_data(guid, self.job.compared_versions)
 
     def save(self):
         if self.new_data is None and self.exception is not None:
             # If no new data has been retrieved due to an exception, use the old job data
             self.new_data = self.old_data
 
-        self.cache_storage.save(self.job, self.job.get_guid(), self.new_data, time.time(), self.tries)
+        self.cache_storage.save(self.job, self.job.get_guid(), self.new_data, time.time(), self.tries, self.etag)
 
     def process(self):
         logger.info('Processing: %s', self.job)
+
+        if self.exception:
+            return self
+
         try:
-            self.load()
-            data = self.job.retrieve(self)
+            try:
+                self.load()
 
-            # Apply automatic filters first
-            data = FilterBase.auto_process(self, data)
+                if self.old_data is None and getattr(self.job, 'treat_new_as_changed', False):
+                    # Force creation of a diff for "NEW"ly found items by pretending we had an empty page before
+                    self.old_data = ''
+                    self.timestamp = None
 
-            # Apply any specified filters
-            filter_list = self.job.filter
+                data = self.job.retrieve(self)
 
-            if filter_list is not None:
-                if isinstance(filter_list, list):
-                    for item in filter_list:
-                        key = next(iter(item))
-                        filter_kind, subfilter = key, item[key]
-                        data = FilterBase.process(filter_kind, subfilter, self, data)
-                elif isinstance(filter_list, str):
-                    for filter_kind in filter_list.split(','):
-                        if ':' in filter_kind:
-                            filter_kind, subfilter = filter_kind.split(':', 1)
-                        else:
-                            subfilter = None
-                        data = FilterBase.process(filter_kind, subfilter, self, data)
-            self.new_data = data
-            self.tries = 0
+                # Apply automatic filters first
+                data = FilterBase.auto_process(self, data)
 
+                # Apply any specified filters
+                for filter_kind, subfilter in FilterBase.normalize_filter_list(self.job.filter):
+                    data = FilterBase.process(filter_kind, subfilter, self, data)
+
+                self.new_data = data
+
+            except Exception as e:
+                # job has a chance to format and ignore its error
+                self.exception = e
+                self.traceback = self.job.format_error(e, traceback.format_exc())
+                self.error_ignored = self.job.ignore_error(e)
+                if not (self.error_ignored or isinstance(e, NotModifiedError)):
+                    self.tries += 1
+                    logger.debug('Increasing number of tries to %i for %s', self.tries, self.job)
         except Exception as e:
+            # job failed its chance to handle error
             self.exception = e
             self.traceback = traceback.format_exc()
+            self.error_ignored = False
             if not isinstance(e, NotModifiedError):
                 self.tries += 1
                 logger.debug('Increasing number of tries to %i for %s', self.tries, self.job)
 
         return self
+
+    def get_diff(self):
+        if self._generated_diff is None:
+            self._generated_diff = self._generate_diff()
+            # Apply any specified diff filters
+            for filter_kind, subfilter in FilterBase.normalize_filter_list(self.job.diff_filter):
+                self._generated_diff = FilterBase.process(filter_kind, subfilter, self, self._generated_diff)
+
+        return self._generated_diff
+
+    def _generate_diff(self):
+        if self.job.diff_tool is None:
+            self.job.diff_tool="/home/martin/martindiff.sh"
+        if self.job.diff_tool is not None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                old_file_path = os.path.join(tmpdir, 'old_file')
+                new_file_path = os.path.join(tmpdir, 'new_file')
+                with open(old_file_path, 'w+b') as old_file, open(new_file_path, 'w+b') as new_file:
+                    old_file.write(self.old_data.encode('utf-8'))
+                    new_file.write(self.new_data.encode('utf-8'))
+                cmdline = shlex.split(self.job.diff_tool) + [old_file_path, new_file_path]
+                proc = subprocess.Popen(cmdline, stdout=subprocess.PIPE)
+                stdout, _ = proc.communicate()
+                # Diff tools return 0 for "nothing changed" or 1 for "files differ", anything else is an error
+                if proc.returncode in (0, 1):
+                    return stdout.decode('utf-8')
+                else:
+                    raise subprocess.CalledProcessError(proc.returncode, cmdline)
+
+        timestamp_old = email.utils.formatdate(self.timestamp, localtime=True)
+        timestamp_new = email.utils.formatdate(self.current_timestamp or time.time(), localtime=True)
+        return '\n'.join(difflib.unified_diff(self.old_data.splitlines(),
+                                              self.new_data.splitlines(),
+                                              '@', '@', timestamp_old, timestamp_new, lineterm=''))
 
 
 class Report(object):
@@ -111,9 +184,7 @@ class Report(object):
 
     def _result(self, verb, job_state):
         if job_state.exception is not None:
-            # TODO: Once we require Python >= 3.5, we can just pass in job_state.exception as "exc_info" parameter
-            exc_info = (type(job_state.exception), job_state.exception, job_state.exception.__traceback__)
-            logger.debug('Got exception while processing %r', job_state.job, exc_info=exc_info)
+            logger.debug('Got exception while processing %r', job_state.job, exc_info=job_state.exception)
 
         job_state.verb = verb
         self.job_states.append(job_state)
@@ -134,6 +205,11 @@ class Report(object):
         for job_state in job_states:
             if not any(job_state.verb == verb and not self.config['display'][verb]
                        for verb in ('unchanged', 'new', 'error')):
+                if (job_state.verb == 'changed'
+                        and not self.config['display'].get('empty-diff', True)
+                        and job_state.get_diff() == ''):
+                    continue
+
                 yield job_state
 
     def finish(self):
@@ -141,3 +217,9 @@ class Report(object):
         duration = (end - self.start)
 
         ReporterBase.submit_all(self, self.job_states, duration)
+
+    def finish_one(self, name):
+        end = datetime.datetime.now()
+        duration = (end - self.start)
+
+        ReporterBase.submit_one(name, self, self.job_states, duration)

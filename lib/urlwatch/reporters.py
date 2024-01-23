@@ -1,6 +1,6 @@
 #
 # This file is part of urlwatch (https://thp.io/2008/urlwatch/).
-# Copyright (c) 2008-2018 Thomas Perl <m@thp.io>
+# Copyright (c) 2008-2022 Thomas Perl <m@thp.io>
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -27,25 +27,24 @@
 # THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
+import asyncio
 import difflib
-import tempfile
-import subprocess
 import re
-import shlex
 import email.utils
 import itertools
 import logging
 import sys
 import time
-import cgi
 import html
+import functools
 
 import requests
 
 import urlwatch
 from .mailer import SMTPMailer
 from .mailer import SendmailMailer
-from .util import TrackSubClasses
+from .util import TrackSubClasses, chunkstring
+from .xmpp import XMPP
 
 try:
     import chump
@@ -57,12 +56,27 @@ try:
 except ImportError:
     Pushbullet = None
 
-logger = logging.getLogger(__name__)
+try:
+    import matrix_client.api
+except ImportError:
+    matrix_client = None
 
+try:
+    # markdown2 is an optional dependency which provides better formatting for Matrix.
+    from markdown2 import Markdown
+except ImportError:
+    Markdown = None
+
+try:
+    from colorama import AnsiToWin32
+except ImportError:
+    AnsiToWin32 = None
+
+logger = logging.getLogger(__name__)
 
 # Regular expressions that match the added/removed markers of GNU wdiff output
 WDIFF_ADDED_RE = r'[{][+].*?[+][}]'
-WDIFF_REMOVED_RE = r'[[][-].*?[-][]]'
+WDIFF_REMOVED_RE = r'[\[][-].*?[-][]]'
 
 
 class ReporterBase(object, metaclass=TrackSubClasses):
@@ -73,6 +87,17 @@ class ReporterBase(object, metaclass=TrackSubClasses):
         self.config = config
         self.job_states = job_states
         self.duration = duration
+
+    def get_signature(self):
+        return (
+            '{pkgname} {version}, {copyright}'.format(pkgname=urlwatch.pkgname,
+                                                      version=urlwatch.__version__,
+                                                      copyright=urlwatch.__copyright__),
+            'Website: {url}'.format(url=urlwatch.__url__),
+            'Buy me a coffee: https://ko-fi.com/thpx86',
+            'watched {count} URLs in {duration} seconds'.format(count=len(self.job_states),
+                                                                duration=self.duration.seconds),
+        )
 
     def convert(self, othercls):
         if hasattr(othercls, '__kind__'):
@@ -92,6 +117,15 @@ class ReporterBase(object, metaclass=TrackSubClasses):
         return '\n'.join(result)
 
     @classmethod
+    def submit_one(cls, name, report, job_states, duration):
+        subclass = cls.__subclasses__[name]
+        cfg = report.config['report'].get(name, {'enabled': False})
+        if cfg['enabled']:
+            subclass(report, cfg, job_states, duration).submit()
+        else:
+            raise ValueError('Reporter not enabled: {name}'.format(name=name))
+
+    @classmethod
     def submit_all(cls, report, job_states, duration):
         any_enabled = False
         for name, subclass in cls.__subclasses__.items():
@@ -102,32 +136,10 @@ class ReporterBase(object, metaclass=TrackSubClasses):
                 subclass(report, cfg, job_states, duration).submit()
 
         if not any_enabled:
-            logger.warn('No reporters enabled.')
+            logger.warning('No reporters enabled.')
 
     def submit(self):
         raise NotImplementedError()
-
-    def unified_diff(self, job_state):
-        if job_state.job.diff_tool is not None:
-            with tempfile.NamedTemporaryFile() as old_file, tempfile.NamedTemporaryFile() as new_file:
-                old_file.write(job_state.old_data.encode('utf-8'))
-                old_file.flush()
-                new_file.write(job_state.new_data.encode('utf-8'))
-                new_file.flush()
-                cmdline = shlex.split(job_state.job.diff_tool) + [old_file.name, new_file.name]
-                proc = subprocess.Popen(cmdline, stdout=subprocess.PIPE)
-                stdout, _ = proc.communicate()
-                # Diff tools return 0 for "nothing changed" or 1 for "files differ", anything else is an error
-                if proc.returncode in (0, 1):
-                    return stdout.decode('utf-8')
-                else:
-                    raise subprocess.CalledProcessError(result, cmdline)
-
-        timestamp_old = email.utils.formatdate(job_state.timestamp, localtime=1)
-        timestamp_new = email.utils.formatdate(time.time(), localtime=1)
-        return ''.join(difflib.unified_diff([l + '\n' for l in job_state.old_data.splitlines()],
-                                            [l + '\n' for l in job_state.new_data.splitlines()],
-                                            '@', '@', timestamp_old, timestamp_new))
 
 
 class SafeHtml(object):
@@ -153,6 +165,7 @@ class HtmlReporter(ReporterBase):
         <html><head>
             <title>urlwatch</title>
             <meta http-equiv="content-type" content="text/html; charset=utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <style type="text/css">
                 body { font-family: sans-serif; }
                 .diff_add { color: green; background-color: lightgreen; }
@@ -170,7 +183,7 @@ class HtmlReporter(ReporterBase):
         for job_state in self.report.get_filtered_job_states(self.job_states):
             job = job_state.job
 
-            if job.__kind__ == 'url':
+            if job.location_is_url():
                 title = '<a href="{location}">{pretty_name}</a>'
             elif job.pretty_name() != job.get_location():
                 title = '<span title="{location}">{pretty_name}</span>'
@@ -188,25 +201,23 @@ class HtmlReporter(ReporterBase):
 
             yield SafeHtml('<hr>')
 
-        yield SafeHtml("""
-        <address>
-        {pkgname} {version}, {copyright}<br>
-        Website: {url}<br>
-        watched {count} URLs in {duration} seconds
-        </address>
+        yield SafeHtml('<address>')
+        for part in self.get_signature():
+            yield SafeHtml('{}<br>').format(part)
+        yield SafeHtml("""</address>
         </body>
         </html>
-        """).format(pkgname=urlwatch.pkgname, version=urlwatch.__version__, copyright=urlwatch.__copyright__,
-                    url=urlwatch.__url__, count=len(self.job_states), duration=self.duration.seconds)
+        """)
 
     def _diff_to_html(self, unified_diff):
-        for line in unified_diff.splitlines():
-            if line.startswith('+'):
-                yield SafeHtml('<span class="unified_add">{line}</span>').format(line=line)
-            elif line.startswith('-'):
-                yield SafeHtml('<span class="unified_sub">{line}</span>').format(line=line)
-            else:
-                yield SafeHtml('<span class="unified_nor">{line}</span>').format(line=line)
+        result = unified_diff
+        diff_mapping = {'+': 'unified_add', '-': 'unified_sub'}
+
+        result = re.sub(r'^([-+]).*$', lambda x: '<span class="' + diff_mapping[x.group(1)] + '">' + x.group(0) + '</span>', result, flags=re.MULTILINE)
+        result = re.sub(WDIFF_ADDED_RE, lambda x: '<span class="diff_add">' + x.group(0) + '</span>', result, flags=re.MULTILINE + re.DOTALL)
+        result = re.sub(WDIFF_REMOVED_RE, lambda x: '<span class="diff_sub">' + x.group(0) + '</span>', result, flags=re.MULTILINE + re.DOTALL)
+
+        return str(SafeHtml('<span class="unified_nor">' + result + '</span>')).splitlines()
 
     def _format_content(self, job_state, difftype):
         if job_state.verb == 'error':
@@ -219,15 +230,16 @@ class HtmlReporter(ReporterBase):
             return SafeHtml('...')
 
         if difftype == 'table':
-            timestamp_old = email.utils.formatdate(job_state.timestamp, localtime=1)
-            timestamp_new = email.utils.formatdate(time.time(), localtime=1)
+            timestamp_old = email.utils.formatdate(job_state.timestamp, localtime=True)
+            timestamp_new = email.utils.formatdate(time.time(), localtime=True)
             html_diff = difflib.HtmlDiff()
-            return SafeHtml(html_diff.make_table(job_state.old_data.splitlines(1), job_state.new_data.splitlines(1),
+            return SafeHtml(html_diff.make_table(job_state.old_data.splitlines(keepends=True),
+                                                 job_state.new_data.splitlines(keepends=True),
                                                  timestamp_old, timestamp_new, True, 3))
         elif difftype == 'unified':
             return ''.join((
                 '<pre>',
-                '\n'.join(self._diff_to_html(self.unified_diff(job_state))),
+                '\n'.join(self._diff_to_html(job_state.get_diff())),
                 '</pre>',
             ))
         else:
@@ -241,6 +253,15 @@ class TextReporter(ReporterBase):
         show_details = cfg['details']
         show_footer = cfg['footer']
 
+        if cfg['minimal']:
+            for job_state in self.report.get_filtered_job_states(self.job_states):
+                pretty_name = job_state.job.pretty_name()
+                location = job_state.job.get_location()
+                if pretty_name != location:
+                    location = '%s ( %s )' % (pretty_name, location)
+                yield ': '.join((job_state.verb.upper(), location))
+            return
+
         summary = []
         details = []
         for job_state in self.report.get_filtered_job_states(self.job_states):
@@ -249,21 +270,19 @@ class TextReporter(ReporterBase):
             details.extend(details_part)
 
         if summary:
-            sep = line_length * '='
-            yield from itertools.chain(
+            sep = (line_length * '=') or None
+            yield from (part for part in itertools.chain(
                 (sep,),
                 ('%02d. %s' % (idx + 1, line) for idx, line in enumerate(summary)),
                 (sep, ''),
-            )
+            ) if part is not None)
 
         if show_details:
             yield from details
 
         if summary and show_footer:
-            yield from ('-- ',
-                        '%s %s, %s' % (urlwatch.pkgname, urlwatch.__version__, urlwatch.__copyright__),
-                        'Website: %s' % (urlwatch.__url__,),
-                        'watched %d URLs in %d seconds' % (len(self.job_states), self.duration.seconds))
+            yield '-- '
+            yield from self.get_signature()
 
     def _format_content(self, job_state):
         if job_state.verb == 'error':
@@ -275,7 +294,7 @@ class TextReporter(ReporterBase):
         if job_state.old_data in (None, job_state.new_data):
             return None
 
-        return self.unified_diff(job_state)
+        return job_state.get_diff()
 
     def _format_output(self, job_state, line_length):
         summary_part = []
@@ -284,7 +303,7 @@ class TextReporter(ReporterBase):
         pretty_name = job_state.job.pretty_name()
         location = job_state.job.get_location()
         if pretty_name != location:
-            location = '%s (%s)' % (pretty_name, location)
+            location = '%s ( %s )' % (pretty_name, location)
 
         pretty_summary = ': '.join((job_state.verb.upper(), pretty_name))
         summary = ': '.join((job_state.verb.upper(), location))
@@ -292,11 +311,12 @@ class TextReporter(ReporterBase):
 
         summary_part.append(pretty_summary)
 
-        sep = line_length * '-'
+        sep = (line_length * '-') or None
         details_part.extend((sep, summary, sep))
         if content is not None:
             details_part.extend((content, sep))
-        details_part.extend(('', ''))
+        details_part.extend(('', '') if sep else ('',))
+        details_part = [part for part in details_part if part is not None]
 
         return summary_part, details_part
 
@@ -306,8 +326,12 @@ class StdoutReporter(TextReporter):
 
     __kind__ = 'stdout'
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._has_color = sys.stdout.isatty() and self.config.get('color', False)
+
     def _incolor(self, color_id, s):
-        if sys.stdout.isatty() and self.config.get('color', False):
+        if self._has_color:
             return '\033[9%dm%s\033[0m' % (color_id, s)
         return s
 
@@ -323,11 +347,18 @@ class StdoutReporter(TextReporter):
     def _blue(self, s):
         return self._incolor(4, s)
 
+    def _get_print(self):
+        if sys.platform == 'win32' and self._has_color and AnsiToWin32 is not None:
+            return functools.partial(print, file=AnsiToWin32(sys.stdout).stream)
+        return print
+
     def submit(self):
+        print = self._get_print()
+
         cfg = self.report.config['report']['text']
         line_length = cfg['line_length']
 
-        separators = (line_length * '=', line_length * '-', '-- ')
+        separators = (line_length * '=', line_length * '-', '-- ') if line_length else ()
         body = '\n'.join(super().submit())
 
         for line in body.splitlines():
@@ -353,9 +384,51 @@ class StdoutReporter(TextReporter):
 
 
 class EMailReporter(TextReporter):
-    """Send summary via e-mail / SMTP"""
+    """Send one email per changed url"""
 
     __kind__ = 'email'
+
+    def submit(self):
+        filtered_job_states = list(self.report.get_filtered_job_states(self.job_states))
+
+        for job_state in filtered_job_states:
+            subject = "change in "+job_state.job.pretty_name()
+            #body_text = '\n'.join(super().submit())
+            #summary_part, body_text = self._format_output(job_state, 200)
+            body_text =  self._format_content(job_state)
+            if not body_text:
+                logger.debug('Not sending e-mail (no changes)')
+                return
+            if self.config['method'] == "smtp":
+                smtp_user = self.config['smtp'].get('user', None) or self.config['from']
+                # Legacy support: The current smtp "auth" setting was previously called "keyring"
+                if 'keyring' in self.config['smtp']:
+                    logger.info('The SMTP config key "keyring" is now called "auth". See https://urlwatch.readthedocs.io/en/latest/deprecated.html')
+                use_auth = self.config['smtp'].get('auth', self.config['smtp'].get('keyring', False))
+                mailer = SMTPMailer(smtp_user, self.config['smtp']['host'], self.config['smtp']['port'],
+                                    self.config['smtp']['starttls'], use_auth,
+                                    self.config['smtp'].get('insecure_password'))
+            elif self.config['method'] == "sendmail":
+                mailer = SendmailMailer(self.config['sendmail']['path'])
+            else:
+                logger.error('Invalid entry for method {method}'.format(method=self.config['method']))
+
+            if self.config['html']:
+                #body_html = '\n'.join(self.convert(HtmlReporter).submit())
+                #body_html = '<pre>'+body_text+'</pre>'
+                body_html = ''+body_text+''
+
+                msg = mailer.msg_html(self.config['from'], self.config['to'], subject, body_text, body_html)
+            else:
+                msg = mailer.msg_plain(self.config['from'], self.config['to'], subject, body_text)
+
+            mailer.send(msg)
+
+
+class EMailSummaryReporter(TextReporter):
+    """Send summary via e-mail / SMTP"""
+
+    __kind__ = 'emailsummary'
 
     def submit(self):
         filtered_job_states = list(self.report.get_filtered_job_states(self.job_states))
@@ -372,9 +445,14 @@ class EMailReporter(TextReporter):
             logger.debug('Not sending e-mail (no changes)')
             return
         if self.config['method'] == "smtp":
-            smtp_user = self.config['smtp'].get('user', self.config['from'])
+            smtp_user = self.config['smtp'].get('user', None) or self.config['from']
+            # Legacy support: The current smtp "auth" setting was previously called "keyring"
+            if 'keyring' in self.config['smtp']:
+                logger.info('The SMTP config key "keyring" is now called "auth". See https://urlwatch.readthedocs.io/en/latest/deprecated.html')
+            use_auth = self.config['smtp'].get('auth', self.config['smtp'].get('keyring', False))
             mailer = SMTPMailer(smtp_user, self.config['smtp']['host'], self.config['smtp']['port'],
-                                self.config['smtp']['starttls'], self.config['smtp']['keyring'])
+                                self.config['smtp']['starttls'], use_auth,
+                                self.config['smtp'].get('insecure_password'))
         elif self.config['method'] == "sendmail":
             mailer = SendmailMailer(self.config['sendmail']['path'])
         else:
@@ -388,6 +466,23 @@ class EMailReporter(TextReporter):
             msg = mailer.msg_plain(self.config['from'], self.config['to'], subject, body_text)
 
         mailer.send(msg)
+
+
+class IFTTTReport(TextReporter):
+    """Send summary via IFTTT"""
+
+    __kind__ = 'ifttt'
+
+    def submit(self):
+        webhook_url = 'https://maker.ifttt.com/trigger/{event}/with/key/{key}'.format(**self.config)
+        for job_state in self.report.get_filtered_job_states(self.job_states):
+            pretty_name = job_state.job.pretty_name()
+            location = job_state.job.get_location()
+            result = requests.post(webhook_url, json={
+                'value1': job_state.verb,
+                'value2': pretty_name,
+                'value3': location,
+            })
 
 
 class WebServiceReporter(TextReporter):
@@ -411,7 +506,7 @@ class WebServiceReporter(TextReporter):
 
         try:
             service = self.web_service_get()
-        except Exception as e:
+        except Exception:
             logger.error('Failed to load or connect to %s - are the dependencies installed and configured?',
                          self.__kind__, exc_info=True)
             return
@@ -425,13 +520,25 @@ class PushoverReport(WebServiceReporter):
     __kind__ = 'pushover'
 
     def web_service_get(self):
+        if chump is None:
+            raise ImportError('Python module "chump" not installed')
+
         app = chump.Application(self.config['app'])
         return app.get_user(self.config['user'])
 
     def web_service_submit(self, service, title, body):
         sound = self.config['sound']
-        device = self.config['device']
-        msg = service.create_message(title=title, message=body, html=True, sound=sound, device=device)
+        # If device is the empty string or not specified at all, use None to send to all devices
+        # (see https://github.com/thp/urlwatch/issues/372)
+        device = self.config.get('device', None) or None
+        priority = {
+            'lowest': chump.LOWEST,
+            'low': chump.LOW,
+            'normal': chump.NORMAL,
+            'high': chump.HIGH,
+            'emergency': chump.EMERGENCY,
+        }.get(self.config.get('priority', None), chump.NORMAL)
+        msg = service.create_message(title=title, message=body, html=True, sound=sound, device=device, priority=priority)
         msg.send()
 
 
@@ -441,6 +548,9 @@ class PushbulletReport(WebServiceReporter):
     __kind__ = 'pushbullet'
 
     def web_service_get(self):
+        if Pushbullet is None:
+            raise ImportError('Python module "pushbullet" not installed')
+
         return Pushbullet(self.config['api_key'])
 
     def web_service_submit(self, service, title, body):
@@ -448,16 +558,23 @@ class PushbulletReport(WebServiceReporter):
 
 
 class MailGunReporter(TextReporter):
-    """Custom email reporter that use mailgun service"""
+    """Send e-mail via the Mailgun service"""
 
     __kind__ = 'mailgun'
 
     def submit(self):
+        region = self.config.get('region', '')
         domain = self.config['domain']
         api_key = self.config['api_key']
         from_name = self.config['from_name']
         from_mail = self.config['from_mail']
         to = self.config['to']
+
+        if region == 'us':
+            region = ''
+
+        if region != '':
+            region = ".{0}".format(region)
 
         filtered_job_states = list(self.report.get_filtered_job_states(self.job_states))
         subject_args = {
@@ -470,12 +587,12 @@ class MailGunReporter(TextReporter):
         body_html = '\n'.join(self.convert(HtmlReporter).submit())
 
         if not body_text:
-            logger.debug('Not calling mailgun API (no changes)')
+            logger.debug('Not calling Mailgun API (no changes)')
             return
 
-        logger.debug("Sending mailgun request for domain:'{0}'".format(domain))
+        logger.debug("Sending Mailgun request for domain:'{0}'".format(domain))
         result = requests.post(
-            "https://api.mailgun.net/v3/{0}/messages".format(domain),
+            "https://api{0}.mailgun.net/v3/{1}/messages".format(region, domain),
             auth=("api", api_key),
             data={"from": "{0} <{1}>".format(from_name, from_mail),
                   "to": to,
@@ -499,7 +616,7 @@ class MailGunReporter(TextReporter):
 
 
 class TelegramReporter(TextReporter):
-    """Custom Telegram reporter"""
+    """Send a message using Telegram"""
     MAX_LENGTH = 4096
 
     __kind__ = 'telegram'
@@ -507,7 +624,8 @@ class TelegramReporter(TextReporter):
     def submit(self):
 
         bot_token = self.config['bot_token']
-        chat_id = self.config['chat_id']
+        chat_ids = self.config['chat_id']
+        chat_ids = [chat_ids] if isinstance(chat_ids, str) else chat_ids
 
         text = '\n'.join(super().submit())
 
@@ -516,17 +634,37 @@ class TelegramReporter(TextReporter):
             return
 
         result = None
-
-        for chunk in self.chunkstring(text, self.MAX_LENGTH):
-            result = self.submitToTelegram(bot_token, chat_id, chunk)
+        for chunk in chunkstring(text, self.MAX_LENGTH, numbering=True):
+            for chat_id in chat_ids:
+                res = self.submitToTelegram(bot_token, chat_id, chunk)
+                if res.status_code != requests.codes.ok or res is None:
+                    result = res
 
         return result
 
+    @staticmethod
+    def _format_body(text: str) -> str:
+        return "```diff\n{}\n```".format(
+            text.translate(str.maketrans({'`': r'\`', '\\': r'\\'})))
+
     def submitToTelegram(self, bot_token, chat_id, text):
         logger.debug("Sending telegram request to chat id:'{0}'".format(chat_id))
-        result = requests.post(
-            "https://api.telegram.org/bot{0}/sendMessage".format(bot_token),
-            data={"chat_id": chat_id, "text": text, "disable_web_page_preview": "true"})
+
+        data = {"chat_id": chat_id,
+                "text": text,
+                "disable_notification": self.config.get('silent', False),
+                "disable_web_page_preview": True}
+
+        if self.config.get('monospace', False):
+            # all "`" and "\" characters are escaped and text is put inside
+            # a markdown code block. API docs on formatting messages:
+            # https://core.telegram.org/bots/api#formatting-options
+            data.update({
+                "text": self._format_body(text),
+                "parse_mode": "MarkdownV2"
+            })
+
+        result = requests.post("https://api.telegram.org/bot{0}/sendMessage".format(bot_token), json=data)
         try:
             json_res = result.json()
 
@@ -540,5 +678,426 @@ class TelegramReporter(TextReporter):
                                                                                                 result.content))
         return result
 
-    def chunkstring(self, string, length):
-        return (string[0 + i:length + i] for i in range(0, len(string), length))
+
+class SlackReporter(TextReporter):
+    """Send a message to a Slack channel"""
+
+    __kind__ = 'slack'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_length = self.config.get('max_message_length', 40000)
+
+    def submit(self):
+        webhook_url = self.config['webhook_url']
+        text = '\n'.join(super().submit())
+
+        if not text:
+            logger.debug('Not calling {} API (no changes)'.format(self.__kind__))
+            return
+
+        result = None
+        for chunk in chunkstring(text, self.max_length, numbering=True):
+            res = self.submit_chunk(webhook_url, chunk)
+            if res.status_code != requests.codes.ok or res is None:
+                result = res
+
+        return result
+
+    def submit_chunk(self, webhook_url, text):
+        logger.debug("Sending {} request with text: {}".format(self.__kind__, text))
+        post_data = {"text": text}
+        result = requests.post(webhook_url, json=post_data)
+        try:
+            if result.status_code == requests.codes.ok:
+                logger.info("{} response: ok".format(self.__kind__))
+            else:
+                logger.error("{} error: {}".format(self.__kind__, result.text))
+        except ValueError:
+            logger.error(
+                "Failed to parse {} response. HTTP status code: {}, content: {}".format(self.__kind__,
+                                                                                        result.status_code,
+                                                                                        result.content))
+        return result
+
+
+class MattermostReporter(SlackReporter):
+    """Send a message to a Mattermost channel"""
+
+    __kind__ = 'mattermost'
+
+
+class DiscordReporter(TextReporter):
+    """Send a message to a Discord channel"""
+
+    __kind__ = 'discord'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_length = self.config.get('max_message_length', 2000)
+
+    def submit(self):
+        webhook_url = self.config['webhook_url']
+        text = '\n'.join(super().submit())
+
+        if not text:
+            logger.debug('Not calling Discord API (no changes)')
+            return
+
+        result = None
+        for chunk in chunkstring(text, self.max_length, numbering=True):
+            res = self.submit_to_discord(webhook_url, chunk)
+            if res.status_code != requests.codes.ok or res is None:
+                result = res
+
+        return result
+
+    def submit_to_discord(self, webhook_url, text):
+        if self.config.get('colored', True):
+            text = "```diff\n" + text + "```"
+
+        if self.config.get('embed', False):
+            filtered_job_states = list(self.report.get_filtered_job_states(self.job_states))
+
+            subject_args = {
+                'count': len(filtered_job_states),
+                'jobs': ', '.join(job_state.job.pretty_name() for job_state in filtered_job_states),
+            }
+
+            subject = self.config['subject'].format(**subject_args)
+
+            post_data = {
+                'content': subject,
+                'embeds': [{
+                    'type': 'rich',
+                    'description': text,
+                }]
+            }
+        else:
+            post_data = {"content": text}
+
+        logger.debug("Sending Discord request with post_data: {0}".format(post_data))
+
+        result = requests.post(webhook_url, json=post_data)
+        try:
+            if result.status_code in (requests.codes.ok, requests.codes.no_content):
+                logger.info("Discord response: ok")
+            else:
+                logger.error("Discord error: {0}".format(result.text))
+        except ValueError:
+            logger.error("Failed to parse Discord response. HTTP status code: {0}, content: {1}".format(result.status_code, result.content))
+        return result
+
+
+class MarkdownReporter(ReporterBase):
+    def submit(self, max_length=None):
+        cfg = self.report.config['report']['markdown']
+        show_details = cfg['details']
+        show_footer = cfg['footer']
+
+        if cfg['minimal']:
+            for job_state in self.report.get_filtered_job_states(self.job_states):
+                pretty_name = job_state.job.pretty_name()
+                location = job_state.job.get_location()
+                if pretty_name != location:
+                    location = '%s (%s)' % (pretty_name, location)
+                yield '* ' + ': '.join((job_state.verb.upper(), location))
+            return
+
+        summary = []
+        details = []
+        for job_state in self.report.get_filtered_job_states(self.job_states):
+            summary_part, details_part = self._format_output(job_state)
+            summary.extend(summary_part)
+            details.extend(details_part)
+
+        if summary and show_footer:
+            footer = ('--- ',) + self.get_signature()
+        else:
+            footer = None
+
+        if not show_details:
+            details = None
+
+        trimmed_msg = "*Parts of the report were omitted due to message length.*\n"
+        max_length -= len(trimmed_msg)
+
+        trimmed, summary, details, footer = MarkdownReporter._render(
+            max_length, summary, details, footer
+        )
+
+        if summary:
+            yield from summary
+            yield ''
+
+        if show_details:
+            for header, body in details:
+                yield header
+                yield body
+                yield ''
+
+        if trimmed:
+            yield trimmed_msg
+
+        if summary and show_footer:
+            yield from footer
+
+    @classmethod
+    def _render(cls, max_length, summary=None, details=None, footer=None):
+        """Render the report components, trimming them if the available length is insufficient.
+
+        Returns a tuple (trimmed, summary, details, footer).
+
+        The first element of the tuple indicates whether any part of the report
+        was omitted due to message length. The other elements are the
+        potentially trimmed report components.
+        """
+
+        # The footer/summary lengths are the sum of the length of their parts
+        # plus the space taken up by newlines.
+        if summary:
+            summary = ['%d. %s' % (idx + 1, line) for idx, line in enumerate(summary)]
+            summary_len = sum(len(part) for part in summary) + len(summary) - 1
+        else:
+            summary_len = 0
+
+        if footer:
+            footer_len = sum(len(part) for part in footer) + len(footer) - 1
+        else:
+            footer_len = 0
+
+        if max_length is None:
+            return (False, summary, details, footer)
+        else:
+            if summary_len > max_length:
+                return (True, [], [], "")
+            elif footer_len > max_length - summary_len:
+                return (True, summary, [], footer[:max_length - summary_len])
+            elif not details:
+                return (False, summary, [], footer)
+            else:
+                # Determine the space remaining after taking into account
+                # summary and footer.
+                remaining_len = max_length - summary_len - footer_len
+                headers_len = sum(len(header) for header, _ in details)
+
+                details_trimmed = False
+
+                # First ensure we can show all the headers.
+                if headers_len > remaining_len:
+                    return (True, summary, [], footer)
+                else:
+                    remaining_len -= headers_len
+
+                    # Calculate approximate available length per item, shared
+                    # equally between all details components.
+                    body_len_per_details = remaining_len // len(details)
+
+                    trimmed_details = []
+                    unprocessed = len(details)
+
+                    for header, body in details:
+                        # Calculate the available length for the body and render it
+                        avail_length = body_len_per_details - 1
+
+                        body_trimmed, body = cls._format_details_body(body, avail_length)
+
+                        if body_trimmed:
+                            details_trimmed = True
+
+                        if len(body) <= body_len_per_details:
+                            trimmed_details.append((header, body))
+                        else:
+                            trimmed_details.append((header, ""))
+
+                        # If the current item's body did not use all of its
+                        # allocated space, distribute the unused space into
+                        # subsequent items, unless we're at the last item
+                        # already.
+                        unused = body_len_per_details - len(body)
+                        remaining_len -= body_len_per_details
+                        remaining_len += unused
+                        unprocessed -= 1
+
+                        if unprocessed > 0:
+                            body_len_per_details = remaining_len // unprocessed
+
+                    return (details_trimmed, summary, trimmed_details, footer)
+
+    @staticmethod
+    def _format_details_body(s, max_length):
+        wrapper_length = len("```diff\n\n```")
+
+        # Message to print when the diff is too long.
+        trim_message = "*diff trimmed*"
+        trim_message_length = len(trim_message)
+
+        if max_length is None or len(s) + wrapper_length <= max_length:
+            return False, "```diff\n{}\n```".format(s)
+        else:
+            target_max_length = max_length - trim_message_length - wrapper_length
+            pos = s.rfind("\n", 0, target_max_length)
+
+            if pos == -1:
+                # Just a single long line, so cut it short.
+                s = s[0:target_max_length]
+            else:
+                # Multiple lines, cut off extra lines.
+                s = s[0:pos]
+
+            return True, "{}\n```diff\n{}\n```".format(trim_message, s)
+
+    def _format_content(self, job_state):
+        if job_state.verb == 'error':
+            return job_state.traceback.strip()
+
+        if job_state.verb == 'unchanged':
+            return job_state.old_data
+
+        if job_state.old_data in (None, job_state.new_data):
+            return None
+
+        return job_state.get_diff()
+
+    def _format_output(self, job_state):
+        summary_part = []
+        details_part = []
+
+        pretty_name = job_state.job.pretty_name()
+        location = job_state.job.get_location()
+        if pretty_name != location:
+            location = '%s (%s)' % (pretty_name, location)
+
+        pretty_summary = ': '.join((job_state.verb.upper(), pretty_name))
+        summary = ': '.join((job_state.verb.upper(), location))
+        content = self._format_content(job_state)
+
+        summary_part.append(pretty_summary)
+
+        if content is not None:
+            details_part.append(('### ' + summary, content))
+
+        return summary_part, details_part
+
+
+class MatrixReporter(MarkdownReporter):
+    """Send a message to a room using the Matrix protocol"""
+    MAX_LENGTH = 16384
+
+    __kind__ = 'matrix'
+
+    def submit(self):
+        if matrix_client is None:
+            raise ImportError('Python module "matrix_client" not installed')
+
+        homeserver_url = self.config['homeserver']
+        access_token = self.config['access_token']
+        room_id = self.config['room_id']
+
+        body_markdown = '\n'.join(super().submit(MatrixReporter.MAX_LENGTH))
+
+        if not body_markdown:
+            logger.debug('Not calling Matrix API (no changes)')
+            return
+
+        client_api = matrix_client.api.MatrixHttpApi(homeserver_url, access_token)
+
+        if Markdown is not None:
+            body_html = Markdown(extras=["fenced-code-blocks", "highlightjs-lang"]).convert(body_markdown)
+
+            client_api.send_message_event(
+                room_id,
+                "m.room.message",
+                content={
+                    "msgtype": "m.text",
+                    "format": "org.matrix.custom.html",
+                    "body": body_markdown,
+                    "formatted_body": body_html
+                }
+            )
+        else:
+            logger.debug('Not formatting as Markdown; dependency on markdown2 not met?')
+            client_api.send_message(room_id, body_markdown)
+
+
+class XMPPReporter(TextReporter):
+    """Send a message using the XMPP Protocol"""
+    MAX_LENGTH = 262144
+
+    __kind__ = 'xmpp'
+
+    def submit(self):
+
+        sender = self.config['sender']
+        recipient = self.config['recipient']
+
+        text = '\n'.join(super().submit())
+
+        if not text:
+            logger.debug('Not sending XMPP message (no changes)')
+            return
+
+        xmpp = XMPP(sender, recipient, self.config.get('insecure_password'))
+
+        for chunk in chunkstring(text, self.MAX_LENGTH, numbering=True):
+            asyncio.run(xmpp.send(chunk))
+
+
+class ProwlReporter(TextReporter):
+    """Send a detailed notification via prowlapp.com"""
+
+    __kind__ = 'prowl'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def submit(self):
+        api_add = 'https://api.prowlapp.com/publicapi/add'
+
+        text = '\n'.join(super().submit())
+
+        if not text:
+            logger.debug('Not calling Prowl API (no changes)')
+            return
+
+        filtered_job_states = list(self.report.get_filtered_job_states(self.job_states))
+        subject_args = {
+            'count': len(filtered_job_states),
+            'jobs': ', '.join(job_state.job.pretty_name() for job_state in filtered_job_states),
+        }
+
+        # 'subject' used in the config file, but the API
+        # uses what might be called the subject as the 'event'
+        event = self.config['subject'].format(**subject_args)
+
+        # 'application' is prepended to the message in prowl,
+        # to show the source of the notification. this too,
+        # is user configurable, and may reference subject args
+        application = self.config.get('application')
+        if application is not None:
+            application = application.format(**subject_args)
+        else:
+            application = '{0} v{1}'.format(urlwatch.pkgname, urlwatch.__version__)
+
+        # build the data to post
+        post_data = {
+            'event': event[:1024].encode('utf8'),
+            'description': text[:10000].encode('utf8'),
+            'application': application[:256].encode('utf8'),
+            'apikey': self.config['api_key'],
+            'priority': self.config['priority']
+        }
+
+        # all set up, add the notification!
+        result = requests.post(api_add, data=post_data)
+
+        try:
+            if result.status_code in (requests.codes.ok, requests.codes.no_content):
+                logger.info("Prowl response: ok")
+            else:
+                logger.error("Prowl error: {0}".format(result.text))
+        except ValueError:
+            logger.error("Failed to parse Prowl response. HTTP status code: {0}, content: {1}".format(
+                result.status_code, result.content))
+
+        return result
