@@ -191,7 +191,7 @@ class JobBase(object, metaclass=TrackSubClasses):
 
 class Job(JobBase):
     __required__ = ()
-    __optional__ = ('name', 'filter', 'max_tries', 'diff_tool', 'compared_versions', 'diff_filter', 'treat_new_as_changed', 'user_visible_url')
+    __optional__ = ('name', 'filter', 'max_tries', 'diff_tool', 'compared_versions', 'diff_filter', 'treat_new_as_changed', 'user_visible_url','to')
 
     # determine if hyperlink "a" tag is used in HtmlReporter
     def location_is_url(self):

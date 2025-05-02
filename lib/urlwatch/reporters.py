@@ -418,9 +418,9 @@ class EMailReporter(TextReporter):
                 #body_html = '<pre>'+body_text+'</pre>'
                 body_html = ''+body_text+''
 
-                msg = mailer.msg_html(self.config['from'], self.config['to'], subject, body_text, body_html)
+                msg = mailer.msg_html(self.config['from'], job_state.job.to, subject, body_text, body_html)
             else:
-                msg = mailer.msg_plain(self.config['from'], self.config['to'], subject, body_text)
+                msg = mailer.msg_plain(self.config['from'], job_state.job.to, subject, body_text)
 
             mailer.send(msg)
 

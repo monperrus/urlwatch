@@ -38,7 +38,8 @@ from .jobs import NotModifiedError
 
 logger = logging.getLogger(__name__)
 
-MAX_WORKERS = 10
+# May 2025: 1 single worker == sequential, for preserving my server
+MAX_WORKERS = 1
 
 
 def run_parallel(func, items):
