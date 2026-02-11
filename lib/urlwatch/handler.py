@@ -151,7 +151,7 @@ class JobState(object):
 
     def _generate_diff(self):
         if self.job.diff_tool is None:
-            self.job.diff_tool="/home/martin/martindiff.sh"
+            self.job.diff_tool="/home/martin/bin/multidiff.py"
         if self.job.diff_tool is not None:
             with tempfile.TemporaryDirectory() as tmpdir:
                 old_file_path = os.path.join(tmpdir, 'old_file')
