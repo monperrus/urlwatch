@@ -371,7 +371,6 @@ class UrlJob(Job):
         return tb
 
     def ignore_error(self, exception):
-        return True # hack by Martin to ignore 503
         if isinstance(exception, requests.exceptions.ConnectionError) and self.ignore_connection_errors:
             return True
         if isinstance(exception, requests.exceptions.Timeout) and self.ignore_timeout_errors:
