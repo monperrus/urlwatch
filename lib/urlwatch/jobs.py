@@ -379,6 +379,8 @@ class UrlJob(Job):
             return True
         elif isinstance(exception, requests.exceptions.HTTPError):
             status_code = exception.response.status_code
+            if status_code >= 400:
+                return True
             ignored_codes = []
             if isinstance(self.ignore_http_error_codes, int) and self.ignore_http_error_codes == status_code:
                 return True
