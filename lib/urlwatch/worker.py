@@ -51,6 +51,12 @@ def run_parallel(func, items):
         yield future.result()
 
 
+def _is_deletion_only(old_data, new_data):
+    """True if new_data only removes lines from old_data (no additions/edits)."""
+    matcher = difflib.SequenceMatcher(None, old_data.splitlines(), new_data.splitlines(), autojunk=False)
+    return all(tag in ('equal', 'delete') for tag, *_ in matcher.get_opcodes())
+
+
 def run_jobs(urlwatcher):
     if not all(1 <= idx <= len(urlwatcher.jobs) for idx in urlwatcher.urlwatch_config.joblist):
         raise ValueError(f'All job indices must be between 1 and {len(urlwatcher.jobs)}: {urlwatcher.urlwatch_config.joblist}')
@@ -98,6 +104,11 @@ def run_jobs(urlwatcher):
                     if job_state.tries > 0:
                         job_state.tries = 0
                         job_state.save()
+                elif _is_deletion_only(job_state.old_data, job_state.new_data):
+                    logger.info('Job %s only has deletions, not reporting', job_state.job)
+                    report.unchanged(job_state)
+                    job_state.tries = 0
+                    job_state.save()
                 else:
                     close_matches = difflib.get_close_matches(job_state.new_data, job_state.history_data, n=1)
                     if close_matches:
