@@ -312,7 +312,7 @@ class Html2TextFilter(FilterBase):
     __kind__ = 'html2text'
 
     __supported_subfilters__ = {
-        'method': 'Method to use for conversion (default: re)',
+        'method': 'Method to use for conversion (default: inscriptis)',
         '<any>': 'Method-specific options passed to html2text',
     }
 
@@ -324,7 +324,7 @@ class Html2TextFilter(FilterBase):
             del subfilter['method']
             options = subfilter
         else:
-            method = 're'
+            method = 'inscriptis'
             options = {}
 
         return html2text(data, baseurl=getattr(self.job, 'url', getattr(self.job, 'navigate', '')),

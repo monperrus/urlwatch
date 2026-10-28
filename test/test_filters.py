@@ -1,8 +1,11 @@
 from urlwatch.filters import GetElementById
 from urlwatch.filters import GetElementByTag
 from urlwatch.filters import JsonFormatFilter
+from urlwatch.filters import Html2TextFilter
 
-from nose.tools import eq_
+
+def eq_(a, b):
+    assert a == b, '%r != %r' % (a, b)
 
 
 def test_get_element_by_id():
@@ -62,3 +65,24 @@ def test_json_format_filter_subfilter():
   },
   "field2": "value"
 }""")
+
+
+HTML2TEXT_INPUT = ('<html><head><script>var x=1;</script></head><body>'
+                   '<h1>Title</h1><p>Hello <a href="/x">link</a></p>'
+                   '<table><tr><td>a</td><td>b</td></tr></table></body></html>')
+
+
+def test_html2text_default_is_inscriptis():
+    html2text_filter = Html2TextFilter(None, None)
+    eq_(html2text_filter.filter(HTML2TEXT_INPUT, {}), 'Title\n\nHello link\n\na  b')
+
+
+def test_html2text_inscriptis_options():
+    html2text_filter = Html2TextFilter(None, None)
+    result = html2text_filter.filter(HTML2TEXT_INPUT, {'method': 'inscriptis', 'display_links': True})
+    eq_(result, 'Title\n\nHello [link](/x)\n\na  b')
+
+
+def test_html2text_re_still_available():
+    html2text_filter = Html2TextFilter(None, None)
+    eq_(html2text_filter.filter(HTML2TEXT_INPUT, {'method': 're'}), 'var x=1;TitleHello linkab')

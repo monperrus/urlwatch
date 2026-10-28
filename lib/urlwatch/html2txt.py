@@ -45,6 +45,12 @@ try:
 except ImportError:
     BeautifulSoup = None
 
+try:
+    import inscriptis
+    from inscriptis.model.config import ParserConfig
+except ImportError:
+    inscriptis = None
+
 
 def html2text(data, baseurl, method, options):
     """
@@ -52,7 +58,10 @@ def html2text(data, baseurl, method, options):
     for easy difference checking.
 
     Method may be one of:
-     'lynx'           - Use "lynx -dump" for conversion
+     'inscriptis'     - Use Python module "inscriptis" (layout-aware, no line wrapping; the default)
+                        options: keyword arguments of inscriptis.model.config.ParserConfig,
+                        e.g. display_links, display_anchors, display_images
+     'lynx'          - Use "lynx -dump" for conversion
                         options: see "lynx -help" output for options that work with "-dump"
      'html2text'      - Use "html2text -nobs" for conversion
                         options: https://linux.die.net/man/1/html2text
@@ -67,6 +76,12 @@ def html2text(data, baseurl, method, options):
         stripped_tags = re.sub(r'<[^>]*>', '', data)
         d = '\n'.join((line.rstrip() for line in stripped_tags.splitlines() if line.strip() != ''))
         return d
+
+    if method == 'inscriptis':
+        if inscriptis is None:
+            raise ImportError('Please install inscriptis')
+        d = inscriptis.get_text(data, ParserConfig(**options))
+        return '\n'.join(line.rstrip() for line in d.splitlines())
 
     if method == 'pyhtml2text':
         if pyhtml2text is None:
